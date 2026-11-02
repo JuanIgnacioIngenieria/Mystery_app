@@ -1,0 +1,14 @@
+{
+  "compilerOptions": {
+    /* El paquete shared se transpila en caliente con tsx/vitest y Metro;
+       para el chequeo de tipos basta con resolverlo por su fuente. */
+    "target": "ES2022",
+    "module": "ESNext",
+    "moduleResolution": "Bundler",
+    "strict": true,
+    "noUncheckedIndexedAccess": true,
+    "noEmit": true,
+    "skipLibCheck": true
+  },
+  "include": ["src", "tests"]
+}

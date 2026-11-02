@@ -1,0 +1,19 @@
+# Dependencias
+node_modules/
+
+# Build y caches
+dist/
+build/
+.cache/
+*.tsbuildinfo
+.expo/
+
+# Entorno y secretos — NUNCA commitear credenciales de Firebase
+.env
+.env.local
+.env.*.local
+firebase-service-account*.json
+
+# Sistema
+.DS_Store
+Thumbs.db
