@@ -1,4 +1,4 @@
-import type { RequestHandler } from 'express';
+import type { Request, RequestHandler } from 'express';
 import type { ZodType } from 'zod';
 import {
   createGameSchema,
@@ -12,7 +12,7 @@ import { Router } from 'express';
 import { isFirebaseConfigured } from '../config/env.js';
 import { requirePlayerAuth } from '../middleware/auth.js';
 import { createRateLimiter } from '../middleware/rate-limit.js';
-import { createGame, getGameState, joinGameByCode } from '../services/games.service.js';
+import { createGame, getGameState, joinGameByCode, leaveGame, startGame } from '../services/games.service.js';
 import { httpError } from '../utils/errors.js';
 
 /**
@@ -100,3 +100,49 @@ gamesRouter.get('/:gameId/state', requirePlayerAuth, async (req, res, next) => {
 
 // Export del tipo de payload para reutilizarlo en la app sin duplicarlo.
 export type { GameSessionPayload };
+
+/**
+ * Helper de las rutas autenticadas sin body: la identidad del jugador SIEMPRE
+ * viene de req.player (la fija requirePlayerAuth con el token) y el gameId
+ * del path, nunca de lo que el cliente diga en ellos.
+ */
+async function withPlayer(
+  req: Request,
+  run: (gameId: string, playerId: string) => Promise<unknown>,
+): Promise<unknown> {
+  const rawGameId = req.params.gameId ?? '';
+  const gameId = Array.isArray(rawGameId) ? (rawGameId[0] ?? '') : rawGameId;
+  const playerId = req.player?.playerId ?? '';
+  if (gameId.length === 0 || playerId.length === 0) {
+    throw httpError(401, 'AUTH_MISSING', 'Falta el token de acceso a la partida.');
+  }
+  return run(gameId, playerId);
+}
+
+/**
+ * Iniciar partida: solo el anfitrión (validado dentro del servicio, en
+ * transacción). Devuelve el estado actualizado del juego.
+ */
+gamesRouter.post('/:gameId/start', requirePlayerAuth, WRITE_LIMITER, async (req, res, next) => {
+  try {
+    const game = await withPlayer(req as Request, (gameId, playerId) =>
+      startGame(gameId, playerId),
+    );
+    res.json({ game });
+  } catch (error) {
+    next(error);
+  }
+});
+
+/**
+ * Abandonar partida: idempotente y liberador — borra la membresía y la
+ * sesión de dispositivo, así el jugador puede volver a crear/unirse.
+ */
+gamesRouter.post('/:gameId/leave', requirePlayerAuth, WRITE_LIMITER, async (req, res, next) => {
+  try {
+    await withPlayer(req as Request, (gameId, playerId) => leaveGame(gameId, playerId));
+    res.json({ ok: true });
+  } catch (error) {
+    next(error);
+  }
+});

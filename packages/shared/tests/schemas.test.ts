@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import {
+  createGameSchema,
   displayNameSchema,
   gameCodeSchema,
   joinGameSchema,
@@ -39,7 +40,23 @@ describe('normalizeGameCode', () => {
 
 describe('joinGameSchema', () => {
   it('valida y normaliza el objeto completo de unión', () => {
-    const parsed = joinGameSchema.parse({ code: ' jk 2m9 ', displayName: ' Ana ' });
-    expect(parsed).toEqual({ code: 'JK2M9', displayName: 'Ana' });
+    const parsed = joinGameSchema.parse({
+      code: ' jk 2m9 ',
+      displayName: ' Ana ',
+      deviceId: 'onboarding-device-0001',
+    });
+    expect(parsed).toEqual({
+      code: 'JK2M9',
+      displayName: 'Ana',
+      deviceId: 'onboarding-device-0001',
+    });
+  });
+
+  it('exige la identidad de dispositivo (restricción de una partida activa por dispositivo)', () => {
+    expect(joinGameSchema.safeParse({ code: 'JK2M9', displayName: 'Ana' }).success).toBe(false);
+    expect(createGameSchema.safeParse({ displayName: 'Ana' }).success).toBe(false);
+    // Formatos atacantes: cadenas sin caracteres permitidos o vacías.
+    expect(joinGameSchema.safeParse({ code: 'JK2M9', displayName: 'Ana', deviceId: '¡hola!' }).success).toBe(false);
+    expect(joinGameSchema.safeParse({ code: 'JK2M9', displayName: 'Ana', deviceId: '' }).success).toBe(false);
   });
 });

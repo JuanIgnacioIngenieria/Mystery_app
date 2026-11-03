@@ -44,13 +44,32 @@ export const displayNameSchema = z
       .max(20, 'El nombre no puede superar los 20 caracteres'),
   );
 
+/**
+ * Identidad estable del dispositivo: la genera la app, vive en SecureStore y
+ * viaja en cada create/join. El backend la HASEA y la usa como clave de la
+ * sesión activa; así se garantiza (no solo en la UI) que cada dispositivo
+ * solo pertenezca a una partida a la vez, incluso con peticiones concurrentes.
+ */
+export const deviceIdSchema = z
+  .string()
+  .transform((v) => v.trim())
+  .pipe(
+    z
+      .string()
+      .min(8, 'Identificador de dispositivo inválido')
+      .max(64, 'Identificador de dispositivo inválido')
+      .regex(/^[A-Za-z0-9-]+$/, 'Identificador de dispositivo inválido'),
+  );
+
 export const createGameSchema = z.object({
   displayName: displayNameSchema,
+  deviceId: deviceIdSchema,
 });
 
 export const joinGameSchema = z.object({
   code: gameCodeSchema,
   displayName: displayNameSchema,
+  deviceId: deviceIdSchema,
 });
 
 // ---------------------------------------------------------------------------
@@ -62,7 +81,6 @@ export type GameCode = z.infer<typeof gameCodeSchema>;
 export type DisplayedName = z.infer<typeof displayNameSchema>;
 export type CreateGameInput = z.infer<typeof createGameSchema>;
 export type JoinGameInput = z.infer<typeof joinGameSchema>;
-
 /** Estado del ciclo de vida de la partida (se ampliará en próximas iteraciones). */
 export type GameStatus = 'open' | 'in_progress' | 'closed';
 
@@ -107,6 +125,9 @@ export type ApiErrorCode =
   | 'GAME_NOT_FOUND'
   | 'GAME_CLOSED'
   | 'GAME_FULL'
+  | 'GAME_NOT_HOST'
+  | 'GAME_IN_PROGRESS'
+  | 'ALREADY_IN_GAME'
   | 'AUTH_MISSING'
   | 'AUTH_INVALID'
   | 'RATE_LIMITED'

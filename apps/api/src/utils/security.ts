@@ -27,5 +27,14 @@ export function hashToken(token: string): string {
   return createHash('sha256').update(token).digest('hex');
 }
 
+/**
+ * El deviceId generado por la app tampoco se almacena en claro: guardamos solo
+ * su hash como clave de la sesión activa. Un filtrado de la base de datos no
+ * permite suplantar ni rastrear dispositivos.
+ */
+export function hashDeviceId(deviceId: string): string {
+  return createHash('sha256').update(deviceId).digest('hex');
+}
+
 /** Formato canónico del token; evita consultas a Firestore con entradas basura. */
 export const TOKEN_PATTERN = /^[0-9a-f]{64}$/;
