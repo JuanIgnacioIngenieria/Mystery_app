@@ -3,16 +3,18 @@ import type { ZodType } from 'zod';
 import {
   createGameSchema,
   joinGameSchema,
+  updatePlayerProfileSchema,
   type CreateGameInput,
   type GameSessionPayload,
   type GameStatePayload,
   type JoinGameInput,
+  type UpdatePlayerProfileInput,
 } from '@mystery/shared';
 import { Router } from 'express';
 import { isFirebaseConfigured } from '../config/env.js';
 import { requirePlayerAuth } from '../middleware/auth.js';
 import { createRateLimiter } from '../middleware/rate-limit.js';
-import { createGame, getGameState, joinGameByCode, leaveGame, startGame } from '../services/games.service.js';
+import { createGame, getGameState, joinGameByCode, leaveGame, startGame, updatePlayerProfile } from '../services/games.service.js';
 import { httpError } from '../utils/errors.js';
 
 /**
@@ -146,3 +148,33 @@ gamesRouter.post('/:gameId/leave', requirePlayerAuth, WRITE_LIMITER, async (req,
     next(error);
   }
 });
+
+/**
+ * Editar perfil: information personal + relaciones del LLAMADOR. La identidad
+ * viene del token (req.player), el body del schema compartido y el resultado
+ * de completitud lo calcula el backend en transacción.
+ */
+gamesRouter.patch(
+  '/:gameId/profile',
+  requirePlayerAuth,
+  WRITE_LIMITER,
+  parseBody(updatePlayerProfileSchema),
+  async (req, res, next) => {
+    try {
+      const rawGameId = req.params.gameId ?? '';
+      const gameId = Array.isArray(rawGameId) ? (rawGameId[0] ?? '') : rawGameId;
+      const playerId = req.player?.playerId ?? '';
+      if (gameId.length === 0 || playerId.length === 0) {
+        throw httpError(401, 'AUTH_MISSING', 'Falta el token de acceso a la partida.');
+      }
+      const result = await updatePlayerProfile(
+        gameId,
+        playerId,
+        res.locals.input as UpdatePlayerProfileInput,
+      );
+      res.json(result);
+    } catch (error) {
+      next(error);
+    }
+  },
+);

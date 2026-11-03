@@ -12,14 +12,30 @@ import { MAX_PLAYERS } from '@mystery/shared';
 import { getFirestoreDb } from '../db/firestore.js';
 import { httpError } from '../utils/errors.js';
 import { generateAccessToken, generateGameCode, hashDeviceId, hashToken } from '../utils/security.js';
+import type {
+  PlayerProfile,
+  PlayerRelation,
+  UpdatePlayerProfileInput,
+  UpdateProfilePayload,
+} from '@mystery/shared';
 
 // ---------------------------------------------------------------------------
 // Modelo de datos en Firestore (solo accesible vía Admin SDK; las reglas
 // deniegan todo acceso directo desde clientes):
 //
 //   games/{id}: { code, status, hostPlayerId, maxPlayers, playerCount, createdAt }
-//   games/{id}/players/{playerId}: { displayName, isHost, tokenHash, deviceHash, joinedAt }
+//   games/{id}/players/{playerId}: {
+//     displayName, isHost, tokenHash, deviceHash, joinedAt,
+//     profile?: PlayerProfile,               // información personal (6 campos)
+//     relations?: { [targetPlayerId]: { level 0-10, description } },  // valoraciones propias
+//     profileCompleted?: boolean,            // decide el indicador del lobby
+//   }
 //   deviceSessions/{deviceHash}: { gameId, playerId, updatedAt }
+//
+// Cada jugador solo actualiza SU documento: las relaciones viajan dentro del
+// documento de quien las establece (from implícito), así un escritor nunca
+// pisa los datos de otro. getGameState devuelve el perfil/relations SOLO del
+// jugador que llama: el contenido personal de los demás nunca se transmite.
 //
 // El código de invitación es compartido; el tokenHash es la credencial
 // privada y jamás sale de este backend. deviceSessions es la fuente de
@@ -37,6 +53,15 @@ interface GameDoc extends DocumentData {
   hostPlayerId: string;
   maxPlayers: number;
   playerCount: number;
+}
+
+/** Documento de jugador: perfil y relaciones viven en el doc de quien las crea. */
+interface PlayerDoc extends DocumentData {
+  displayName: string;
+  isHost: boolean;
+  profile?: PlayerProfile;
+  relations?: Record<string, PlayerRelation>;
+  profileCompleted?: boolean;
 }
 
 function db() {
@@ -225,6 +250,18 @@ export async function joinGameByCode(input: JoinGameInput): Promise<GameSessionP
       );
     }
 
+    // Un nuevo jugador implica valoraciones pendientes para quien ya estaba:
+    // si su perfil estaba completo se marca INCOMPLETO (no se borra nada de
+    // su información, solo la bandera). En la misma transacción: sin carreras
+    // y consistente para todos los clientes.
+    const existingPlayers = await tx.get(gameDoc.ref.collection('players'));
+    for (const doc of existingPlayers.docs) {
+      const player = doc.data() as PlayerDoc;
+      if (player.profileCompleted === true) {
+        tx.update(doc.ref, { profileCompleted: false });
+      }
+    }
+
     const playerRef = gameDoc.ref.collection('players').doc(playerId);
     tx.create(playerRef, {
       displayName: input.displayName,
@@ -290,18 +327,138 @@ export async function getGameState(gameId: string, token: string): Promise<GameS
 
   const playersSnap = await gameRef.collection('players').orderBy('joinedAt', 'asc').get();
   const gameData = gameSnap.data() as GameDoc;
+  const callerData = caller.data() as PlayerDoc;
 
   return {
     game: toGameView(gameSnap.id, gameData),
     players: playersSnap.docs.map((doc) => {
-      const p = doc.data();
+      const p = doc.data() as PlayerDoc;
       return {
         id: doc.id,
         displayName: typeof p.displayName === 'string' ? p.displayName : '¿?',
         isHost: p.isHost === true,
+        // Flag persistido por el backend al guardar el perfil; undefined =
+        // perfil sin tocar (indicador gris en el lobby).
+        profileCompleted: typeof p.profileCompleted === 'boolean' ? p.profileCompleted : undefined,
       };
     }),
+    // El contenido personal viaja ÚNICAMENTE para quien llama: los perfiles
+    // de otros jugadores no se exponen (privacidad y más pequeña la carga).
+    myProfile: isProfileShape(callerData.profile)
+      ? sanitizeProfile(callerData.profile)
+      : null,
+    myRelations: sanitizeRelations(callerData.relations),
   };
+}
+
+/** Chequeo defensivo de documentos antiguos/foráneos en Firestore. */
+function isProfileShape(value: unknown): value is PlayerProfile {
+  return (
+    typeof value === 'object' &&
+    value !== null &&
+    ['aboutMe', 'job', 'clothing', 'hobbies', 'drinks', 'fears'].every(
+      (field) => typeof (value as Record<string, unknown>)[field] === 'string',
+    )
+  );
+}
+
+function sanitizeProfile(profile: PlayerProfile): PlayerProfile {
+  const pick = (value: unknown): string => (typeof value === 'string' ? value : '');
+  return {
+    aboutMe: pick(profile.aboutMe),
+    job: pick(profile.job),
+    clothing: pick(profile.clothing),
+    hobbies: pick(profile.hobbies),
+    drinks: pick(profile.drinks),
+    fears: pick(profile.fears),
+  };
+}
+
+function sanitizeRelations(
+  relations: PlayerDoc['relations'],
+): Record<string, PlayerRelation> {
+  const output: Record<string, PlayerRelation> = {};
+  if (typeof relations !== 'object' || relations === null) return output;
+  for (const [targetId, raw] of Object.entries(relations)) {
+    if (typeof raw !== 'object' || raw === null) continue;
+    const candidate = raw as { level?: unknown; description?: unknown };
+    const level = typeof candidate.level === 'number' && Number.isInteger(candidate.level)
+      && candidate.level >= 0 && candidate.level <= 10
+      ? candidate.level
+      : null;
+    if (level === null) continue; // Valoración corrupta: se descarta, no se inventa.
+    output[targetId] = {
+      level,
+      description: typeof candidate.description === 'string' ? candidate.description : '',
+    };
+  }
+  return output;
+}
+
+/**
+ * Guarda el perfil del LLAMADOR (nunca de otro): information personal +
+ * valoraciones/relaciones. En la misma transacción decide si el perfil está
+ * COMPLETO (seis campos con contenido y una valoración por cada uno de los
+ * demás jugadores actuales) y persiste la bandera profileCompleted. El
+ * cliente solo sabe el resultado; la fuente de verdad es Firestore.
+ */
+export async function updatePlayerProfile(
+  gameId: string,
+  playerId: string,
+  input: UpdatePlayerProfileInput,
+): Promise<UpdateProfilePayload> {
+  return db().runTransaction(async (tx) => {
+    const gameRef = db().collection('games').doc(gameId);
+    const [gameSnap, playersSnap, playerSnap] = await Promise.all([
+      tx.get(gameRef),
+      tx.get(gameRef.collection('players')),
+      tx.get(gameRef.collection('players').doc(playerId)),
+    ]);
+
+    if (!gameSnap.exists) {
+      throw httpError(404, 'GAME_NOT_FOUND', 'La partida ya no existe.');
+    }
+    if (!playerSnap.exists) {
+      throw httpError(401, 'AUTH_INVALID', 'Tu credencial ya no es válida.');
+    }
+
+    const otherIds = new Set(
+      playersSnap.docs.filter((doc) => doc.id !== playerId).map((doc) => doc.id),
+    );
+
+    const relations: Record<string, PlayerRelation> = {};
+    for (const [targetId, relation] of Object.entries(input.relations)) {
+      if (targetId === playerId) {
+        throw httpError(400, 'VALIDATION_ERROR', 'No puedes valorarte a ti mismo.');
+      }
+      if (!otherIds.has(targetId)) {
+        throw httpError(
+          400,
+          'VALIDATION_ERROR',
+          'Has valorado a un jugador que ya no está en la partida. Revisa las relaciones.',
+        );
+      }
+      relations[targetId] = { level: relation.level, description: relation.description };
+    }
+
+    // Completitud: todos los campos personales con contenido + valoración
+    // (o-10) por cada OTRO jugador de la partida en este momento. La
+    // "relación especial" (descripción) es opcional: no todo el mundo tiene
+    // vínculos destacados, por eso solo se exige el nivel.
+    const profile: PlayerProfile = input.profile;
+    const personalComplete = Object.values(profile).every((field) => field.length > 0);
+    const relationsComplete = otherIds.size === Object.keys(relations).length;
+    const profileCompleted = personalComplete && relationsComplete;
+
+    tx.update(playerSnap.ref, {
+      profile,
+      relations,
+      profileCompleted,
+      profileUpdatedAt: FieldValue.serverTimestamp(),
+    });
+
+    return { profileCompleted };
+  });
 }
 
 /**

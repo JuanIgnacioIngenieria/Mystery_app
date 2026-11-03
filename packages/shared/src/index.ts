@@ -73,6 +73,50 @@ export const joinGameSchema = z.object({
 });
 
 // ---------------------------------------------------------------------------
+// Perfil del jugador y relaciones. La completitud de un perfil la decide el
+// backend; aquí solo definimos forma y límites de los datos.
+// ---------------------------------------------------------------------------
+
+const PROFILE_TEXT_MAX = 600;
+const RELATION_TEXT_MAX = 200;
+
+/** Texto libre del perfil: se normaliza (trim) pero se admite vacío, porque
+ *  guardarse incompleto es válido; lo que no vale es exceder los límites. */
+const profileTextSchema = z
+  .string()
+  .transform((v) => v.trim())
+  .pipe(z.string().max(PROFILE_TEXT_MAX, `Máximo ${PROFILE_TEXT_MAX} caracteres`));
+
+/** Relación con otro jugador concreto: nivel 0-10 y descripción opcional. */
+export const playerRelationSchema = z.object({
+  level: z
+    .number()
+    .int('La valoración debe ser un número entero')
+    .min(0, 'El nivel mínimo es 0')
+    .max(10, 'El nivel máximo es 10'),
+  description: z
+    .string()
+    .transform((v) => v.trim())
+    .pipe(z.string().max(RELATION_TEXT_MAX, `Máximo ${RELATION_TEXT_MAX} caracteres`)),
+});
+
+export const playerProfileSchema = z.object({
+  aboutMe: profileTextSchema,
+  job: profileTextSchema,
+  clothing: profileTextSchema,
+  hobbies: profileTextSchema,
+  drinks: profileTextSchema,
+  fears: profileTextSchema,
+});
+
+/** Cuerpo de PATCH /games/:id/profile. Los ids objetivo de las relaciones se
+ *  verifican contra los jugadores reales de la partida en el backend. */
+export const updatePlayerProfileSchema = z.object({
+  profile: playerProfileSchema,
+  relations: z.record(z.string(), playerRelationSchema),
+});
+
+// ---------------------------------------------------------------------------
 // Contratos de la API. Tipos derivados de los schemas para que un documento
 // de Firestore y una respuesta HTTP nunca se desalineen.
 // ---------------------------------------------------------------------------
@@ -81,6 +125,9 @@ export type GameCode = z.infer<typeof gameCodeSchema>;
 export type DisplayedName = z.infer<typeof displayNameSchema>;
 export type CreateGameInput = z.infer<typeof createGameSchema>;
 export type JoinGameInput = z.infer<typeof joinGameSchema>;
+export type PlayerProfile = z.infer<typeof playerProfileSchema>;
+export type PlayerRelation = z.infer<typeof playerRelationSchema>;
+export type UpdatePlayerProfileInput = z.infer<typeof updatePlayerProfileSchema>;
 /** Estado del ciclo de vida de la partida (se ampliará en próximas iteraciones). */
 export type GameStatus = 'open' | 'in_progress' | 'closed';
 
@@ -89,6 +136,12 @@ export interface PlayerView {
   id: string;
   displayName: string;
   isHost: boolean;
+  /**
+   * Estado del perfil (decidido por el backend): undefined = sin tocar
+   * (indicador gris), true = completado (tick verde), false = incompleto
+   * (cruz roja). El contenido del perfil NUNCA viaja en esta vista.
+   */
+  profileCompleted?: boolean;
 }
 
 /** Vista pública de una partida: el código es lo único que se comparte por chat. */
@@ -113,6 +166,14 @@ export interface GameSessionPayload {
 export interface GameStatePayload {
   game: GameView;
   players: PlayerView[];
+  /** Perfil y relaciones del LLAMADOR únicamente: los perfiles ajenos no viajan. */
+  myProfile?: PlayerProfile | null;
+  myRelations?: Record<string, PlayerRelation>;
+}
+
+/** Respuesta al guardar el perfil: el backend decide si quedó completo. */
+export interface UpdateProfilePayload {
+  profileCompleted: boolean;
 }
 
 // ---------------------------------------------------------------------------
