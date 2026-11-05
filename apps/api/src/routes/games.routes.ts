@@ -15,6 +15,7 @@ import { isFirebaseConfigured } from '../config/env.js';
 import { requirePlayerAuth } from '../middleware/auth.js';
 import { createRateLimiter } from '../middleware/rate-limit.js';
 import { createGame, getGameState, joinGameByCode, leaveGame, startGame, updatePlayerProfile } from '../services/games.service.js';
+import { getMysteryForPlayer } from '../services/mystery.service.js';
 import { httpError } from '../utils/errors.js';
 
 /**
@@ -120,6 +121,22 @@ async function withPlayer(
   }
   return run(gameId, playerId);
 }
+
+/**
+ * Vista del misterio PARA EL JUGADOR que llama (requiere partida 'ready').
+ * El servicio filtra el payload: solo su personaje privado + info pública
+ * compartida; nunca solution/resolución ni la verdad bruta de la cronología.
+ */
+gamesRouter.get('/:gameId/mystery', requirePlayerAuth, async (req, res, next) => {
+  try {
+    const mystery = await withPlayer(req as Request, (gameId, playerId) =>
+      getMysteryForPlayer(gameId, playerId),
+    );
+    res.json(mystery);
+  } catch (error) {
+    next(error);
+  }
+});
 
 /**
  * Iniciar partida: solo el anfitrión (validado dentro del servicio, en

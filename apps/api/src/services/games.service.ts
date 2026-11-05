@@ -1,4 +1,4 @@
-import { FieldValue, type DocumentData, type Transaction } from 'firebase-admin/firestore';
+import { FieldValue, type DocumentData, type Timestamp, type Transaction } from 'firebase-admin/firestore';
 import type {
   CreateGameInput,
   GameSessionPayload,
@@ -6,10 +6,12 @@ import type {
   GameStatus,
   GameView,
   JoinGameInput,
+  MysteryContext,
   PlayerView,
 } from '@mystery/shared';
-import { MAX_PLAYERS } from '@mystery/shared';
+import { MAX_PLAYERS, MIN_PLAYERS } from '@mystery/shared';
 import { getFirestoreDb } from '../db/firestore.js';
+import { env, isGenerationConfigured } from '../config/env.js';
 import { httpError } from '../utils/errors.js';
 import { generateAccessToken, generateGameCode, hashDeviceId, hashToken } from '../utils/security.js';
 import type {
@@ -18,24 +20,31 @@ import type {
   UpdatePlayerProfileInput,
   UpdateProfilePayload,
 } from '@mystery/shared';
+import { readGenerationError, runMysteryGeneration } from './mystery.service.js';
+import { buildMysteryContext } from './mystery-generation/context.js';
 
 // ---------------------------------------------------------------------------
 // Modelo de datos en Firestore (solo accesible vía Admin SDK; las reglas
 // deniegan todo acceso directo desde clientes):
 //
-//   games/{id}: { code, status, hostPlayerId, maxPlayers, playerCount, createdAt }
+//   games/{id}: { code, status, hostPlayerId, maxPlayers, playerCount, createdAt,
+//                 mysteryContext?,        // snapshot del contexto (solo en generating+)
+//                 generationStartedAt?,   // detecta generaciones huérfanas
+//                 lastGenerationError? }  // razón legible del último fallo
 //   games/{id}/players/{playerId}: {
 //     displayName, isHost, tokenHash, deviceHash, joinedAt,
 //     profile?: PlayerProfile,               // información personal (6 campos)
 //     relations?: { [targetPlayerId]: { level 0-10, description } },  // valoraciones propias
 //     profileCompleted?: boolean,            // decide el indicador del lobby
 //   }
+//   games/{id}/mystery/current: { provider, payload, generatedAt }
 //   deviceSessions/{deviceHash}: { gameId, playerId, updatedAt }
 //
 // Cada jugador solo actualiza SU documento: las relaciones viajan dentro del
 // documento de quien las establece (from implícito), así un escritor nunca
 // pisa los datos de otro. getGameState devuelve el perfil/relations SOLO del
-// jugador que llama: el contenido personal de los demás nunca se transmite.
+// jugador que llama: el contenido personal de los demás nunca se transmite
+// (y el mysteryContext tampoco: contiene los perfiles de TODOS).
 //
 // El código de invitación es compartido; el tokenHash es la credencial
 // privada y jamás sale de este backend. deviceSessions es la fuente de
@@ -47,16 +56,22 @@ import type {
 /** Máximo de reintentos si el CSPRNG produce un código ya en uso. */
 const MAX_CODE_ATTEMPTS = 5;
 
-interface GameDoc extends DocumentData {
+export interface GameDoc extends DocumentData {
   code: string;
   status: GameStatus;
   hostPlayerId: string;
   maxPlayers: number;
   playerCount: number;
+  /** Snapshot del contexto congelado al iniciar la generación. */
+  mysteryContext?: MysteryContext;
+  /** Marca temporal del último intento de generación. */
+  generationStartedAt?: Timestamp;
+  /** Último fallo de generación (razón legible para la UI). */
+  lastGenerationError?: { code: string; message: string };
 }
 
 /** Documento de jugador: perfil y relaciones viven en el doc de quien las crea. */
-interface PlayerDoc extends DocumentData {
+export interface PlayerDoc extends DocumentData {
   displayName: string;
   isHost: boolean;
   profile?: PlayerProfile;
@@ -348,6 +363,9 @@ export async function getGameState(gameId: string, token: string): Promise<GameS
       ? sanitizeProfile(callerData.profile)
       : null,
     myRelations: sanitizeRelations(callerData.relations),
+    // Razón del último fallo de generación: alimenta el mensaje junto al
+    // botón de inicio. Es estado interno persistido, no datos del proveedor.
+    lastGenerationError: readGenerationError(gameData),
   };
 }
 
@@ -422,6 +440,19 @@ export async function updatePlayerProfile(
       throw httpError(401, 'AUTH_INVALID', 'Tu credencial ya no es válida.');
     }
 
+    // Durante la generación el contexto YA ESTÁ CONGELADO (snapshot de la
+    // transacción de inicio): editar perfiles ahora rompería la coherencia
+    // entre el misterio que se fabrica y los datos vivos. En cuanto termine
+    // ('ready' o 'generation_error') se vuelve a permitir editar.
+    const gameData = gameSnap.data() as GameDoc;
+    if (gameData.status === 'generating') {
+      throw httpError(
+        409,
+        'GENERATION_IN_PROGRESS',
+        'El misterio se está generando: no se pueden modificar los perfiles hasta que termine.',
+      );
+    }
+
     const otherIds = new Set(
       playersSnap.docs.filter((doc) => doc.id !== playerId).map((doc) => doc.id),
     );
@@ -462,18 +493,46 @@ export async function updatePlayerProfile(
 }
 
 /**
- * El creador arranca la partida: 'open' → 'in_progress'. La transacción
- * revalida que quien llama es el anfitrión y que la partida sigue abierta,
- * de modo que ni un token robado ni una UI manipulada puedan arrancar
- * el caso de otro.
+ * Umbral tras el cual una partida atascada en 'generating' se considera
+ * huérfana (p. ej. proceso reiniciado a mitad de generación) y un nuevo
+ * /start puede recuperar la partida: timeout del proveedor + margen de
+ * gracia. Garantiza que ningún fallo deje la partida bloqueada para siempre.
+ */
+const GENERATION_STALE_MS = env.generation.timeoutMs + 60_000;
+
+/**
+ * El creador arranca la preparación del misterio. La transacción revalida
+ * TODO (anfitrión, estado, cupo mínimo, perfiles completos) y congela un
+ * SNAPSHOT consistente de los datos (mysteryContext) antes de transicionar
+ * 'open' | 'generation_error' → 'generating'. La generación en sí corre en
+ * SEGUNDO PLANO (runMysteryGeneration): este endpoint responde en milisegundos
+ * y los clientes siguen el proceso por sondeo del estado (GET /state).
+ *
+ * - Ni un token robado ni una UI manipulada pueden iniciar la partida sin
+ *   ser anfitrión: se re-verifica dentro de la transacción.
+ * - Dos /start concurrentes: la transacción re-ejecuta y el segundo ve el
+ *   estado 'generating' que persistió el primero → 409.
+ * - Generación huérfana (proceso caído): superado GENERATION_STALE_MS se
+ *   permite reintentar en lugar de dejar la partida bloqueada para siempre.
  */
 export async function startGame(gameId: string, playerId: string): Promise<GameView> {
+  // Error controlado e inmediato (§ integración IA): sin proveedor no se
+  // transiciona a 'generating' para un intento condenado de antemano.
+  if (!isGenerationConfigured()) {
+    throw httpError(
+      503,
+      'GENERATION_NOT_CONFIGURED',
+      'No se ha podido generar el misterio. El servicio de generación no está disponible actualmente. Puedes volver a intentarlo más tarde.',
+    );
+  }
+
   const gameRef = db().collection('games').doc(gameId);
 
   const started = await db().runTransaction(async (tx) => {
-    const [gameSnap, callerSnap] = await Promise.all([
+    const [gameSnap, callerSnap, playersSnap] = await Promise.all([
       tx.get(gameRef),
       tx.get(gameRef.collection('players').doc(playerId)),
+      tx.get(gameRef.collection('players')),
     ]);
 
     if (!gameSnap.exists) {
@@ -481,19 +540,71 @@ export async function startGame(gameId: string, playerId: string): Promise<GameV
     }
     const caller = callerSnap.data() as DocumentData | undefined;
     if (!callerSnap.exists || caller?.isHost !== true) {
-      throw httpError(403, 'GAME_NOT_HOST', 'Solo el creador puede iniciar la partida.');
+      throw httpError(403, 'GAME_NOT_HOST', 'Solo el anfitrión puede comenzar la partida.');
     }
 
     const data = gameSnap.data() as GameDoc;
-    if (data.status === 'in_progress') {
-      throw httpError(409, 'GAME_IN_PROGRESS', 'La partida ya ha comenzado.');
-    }
-    if (data.status !== 'open') {
+    if (data.status === 'generating') {
+      // Generación en curso: solo se puede reintentar si el intento previo
+      // es huérfano (más antiguo que el presupuesto de espera + gracia).
+      const startedAt = data.generationStartedAt;
+      const elapsedMs = startedAt?.toDate
+        ? Date.now() - startedAt.toDate().getTime()
+        : Number.POSITIVE_INFINITY;
+      if (elapsedMs < GENERATION_STALE_MS) {
+        throw httpError(
+          409,
+          'GENERATION_IN_PROGRESS',
+          'El misterio ya se está generando. Espera a que termine el proceso.',
+        );
+      }
+    } else if (data.status === 'ready' || data.status === 'in_progress') {
+      throw httpError(409, 'GAME_IN_PROGRESS', 'El misterio de esta partida ya está preparado.');
+    } else if (data.status !== 'open' && data.status !== 'generation_error') {
       throw httpError(409, 'GAME_CLOSED', 'Esta partida está cerrada y no puede iniciarse.');
     }
 
-    tx.update(gameRef, { status: 'in_progress' });
-    return toGameView(gameSnap.id, { ...data, status: 'in_progress' });
+    // Condiciones de inicio (§ nuevo requisito): mínimo de participantes y
+    // TODOS los perfiles completos (la bandera la calcula y persiste el
+    // backend al guardar cada perfil; un join reciente la resetea en los
+    // demás dentro de la misma transacción).
+    if (playersSnap.docs.length < MIN_PLAYERS) {
+      throw httpError(
+        409,
+        'GAME_NOT_READY',
+        `Se necesitan al menos ${MIN_PLAYERS} jugadores para comenzar la partida.`,
+      );
+    }
+    const pendingProfiles = playersSnap.docs.filter(
+      (doc) => (doc.data() as PlayerDoc).profileCompleted !== true,
+    );
+    if (pendingProfiles.length > 0) {
+      throw httpError(
+        409,
+        'GAME_NOT_READY',
+        'Todos los jugadores deben completar su perfil antes de comenzar la partida.',
+      );
+    }
+
+    // Snapshot CONSISTENTE: el contexto se construye solo con la copia leída
+    // aquí. Joins o ediciones posteriores no pueden alterar esta generación.
+    const context = buildMysteryContext(gameSnap, playersSnap.docs);
+
+    tx.update(gameRef, {
+      status: 'generating',
+      mysteryContext: context,
+      generationStartedAt: FieldValue.serverTimestamp(),
+      lastGenerationError: FieldValue.delete(),
+    });
+    return toGameView(gameSnap.id, { ...data, status: 'generating' });
+  });
+
+  // El proceso corre en segundo plano: nunca bloquea la respuesta HTTP ni
+  // depende de que el anfitrión siga conectado. runMysteryGeneration no lanza
+  // (todo fallo persiste 'generation_error'); el catch es un cinturón extra
+  // para no dejar un unhandled rejection si algo se escapa.
+  void runMysteryGeneration(gameId).catch((error) => {
+    console.error('[api] fallo inesperado del orquestador de generación:', error);
   });
 
   return started;

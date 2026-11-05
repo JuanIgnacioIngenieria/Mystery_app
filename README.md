@@ -59,6 +59,9 @@ Abre el proyecto en **Expo Go** (escanea el QR). El backend por defecto se deduc
 | `FIREBASE_CLIENT_EMAIL` | apps/api/.env | Email de la cuenta de servicio |
 | `FIREBASE_PRIVATE_KEY` | apps/api/.env | Clave privada (una línea, `\n` escapados) |
 | `EXPO_PUBLIC_API_URL` | apps/mobile/.env | URL del backend cuando no es deducible del host de Expo |
+| `AI_GENERATION_URL` | apps/api/.env | Endpoint del proveedor de IA. Sin él, «Comenzar partida» responde 503 controlado |
+| `AI_GENERATION_API_KEY` | apps/api/.env | Credencial del proveedor (solo backend, nunca en la app) |
+| `AI_GENERATION_TIMEOUT_MS` | apps/api/.env | Presupuesto de espera del proveedor (120000 por defecto) |
 
 ## Comandos
 

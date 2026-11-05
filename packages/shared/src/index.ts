@@ -12,6 +12,9 @@ export const GAME_CODE_LENGTH = 5;
 /** Máximo de jugadores por partida (el anfitrión cuenta como primero). */
 export const MAX_PLAYERS = 10;
 
+/** Mínimo de jugadores para poder comenzar la partida. */
+export const MIN_PLAYERS = 3;
+
 /** Longitud del token de acceso privado (en bytes, antes de hex-encode). */
 export const ACCESS_TOKEN_BYTES = 32;
 
@@ -128,8 +131,26 @@ export type JoinGameInput = z.infer<typeof joinGameSchema>;
 export type PlayerProfile = z.infer<typeof playerProfileSchema>;
 export type PlayerRelation = z.infer<typeof playerRelationSchema>;
 export type UpdatePlayerProfileInput = z.infer<typeof updatePlayerProfileSchema>;
-/** Estado del ciclo de vida de la partida (se ampliará en próximas iteraciones). */
-export type GameStatus = 'open' | 'in_progress' | 'closed';
+/**
+ * Estado del ciclo de vida de la partida. Las transiciones las controla
+ * SIEMPRE el backend (ninguna escritura de estado proviene del cliente):
+ *
+ *   open ──(start, host, condiciones válidas)──▶ generating
+ *   generating ──(éxito)──▶ ready
+ *   generating ──(fallo)──▶ generation_error
+ *   generation_error ──(reintento del anfitrión)──▶ generating
+ *   cualquier estado ──(abandono del anfitrión)──▶ closed
+ *
+ * 'in_progress' se conserva por compatibilidad con partidas ya existentes;
+ * el flujo actual ya no lo establece (la fase de juego es otra iteración).
+ */
+export type GameStatus =
+  | 'open'
+  | 'generating'
+  | 'ready'
+  | 'generation_error'
+  | 'in_progress'
+  | 'closed';
 
 /** Vista pública de un jugador: nunca incluye el hash del token ni datos privados. */
 export interface PlayerView {
@@ -169,11 +190,136 @@ export interface GameStatePayload {
   /** Perfil y relaciones del LLAMADOR únicamente: los perfiles ajenos no viajan. */
   myProfile?: PlayerProfile | null;
   myRelations?: Record<string, PlayerRelation>;
+  /** Último fallo de generación (solo visible con 'generation_error'). */
+  lastGenerationError?: GenerationErrorView | null;
 }
 
 /** Respuesta al guardar el perfil: el backend decide si quedó completo. */
 export interface UpdateProfilePayload {
   profileCompleted: boolean;
+}
+
+// ---------------------------------------------------------------------------
+// Contexto de generación del misterio. Lo construye el BACKEND desde
+// Firestore y viaja al proveedor de IA. Contrato de salida estable: si
+// mañana se añaden campos, se hace al final de cada objeto sin renombrar
+// los existentes para no romper proveedores ya integrados.
+// ---------------------------------------------------------------------------
+
+/** Relación especial redactada (con descripción) hacia otro participante. */
+export interface MysterySpecialRelationship {
+  targetPlayerId: string;
+  description: string;
+}
+
+/** Valoración de afinidad (0-10) hacia otro participante. */
+export interface MysteryRelationship {
+  targetPlayerId: string;
+  level: number;
+}
+
+/** Perfil personal tal como lo consume el proveedor de IA. */
+export interface MysteryPlayerProfile {
+  description: string;
+  occupation: string;
+  clothing: string;
+  habitsAndHobbies: string;
+  drinks: string;
+  fears: string;
+}
+
+/** Participante del contexto: identificadores estables + perfil + relaciones. */
+export interface MysteryPlayerContext {
+  playerId: string;
+  username: string;
+  isHost: boolean;
+  profile: MysteryPlayerProfile;
+  specialRelationships: MysterySpecialRelationship[];
+  relationships: MysteryRelationship[];
+}
+
+/** Contexto completo de la partida que se envía al proveedor de IA. */
+export interface MysteryContext {
+  gameId: string;
+  gameCode: string;
+  hostId: string;
+  participantCount: number;
+  players: MysteryPlayerContext[];
+}
+
+/** Último fallo de generación persistido; alimenta el mensaje junto al
+ *  botón de inicio (el cliente no recibe trazas técnicas del proveedor). */
+export interface GenerationErrorView {
+  code: string;
+  message: string;
+}
+
+// ---------------------------------------------------------------------------
+// Vista del misterio para el JUGADOR (FASE 6). El backend la construye
+// filtrando games/{id}/mystery/current: cada jugador recibe SU personaje
+// (con su información privada) y solo la información compartida. La
+// solution, la resolución del crimen y la verdad absoluta de la cronología
+// NUNCA viajan al cliente; el rol de asesino/cómplice solo aparece en la
+// vista de quien lo desempeña.
+// ---------------------------------------------------------------------------
+
+/** Pista visible para el llamador (knownToMe = ya la conoía al empezar). */
+export interface MysteryClueView {
+  clueId: string;
+  name: string;
+  content: string;
+  knownToMe: boolean;
+}
+
+/** Habitación con SOLO las pistas visibles para el llamador. */
+export interface MysteryRoomView {
+  roomId: string;
+  name: string;
+  description: string;
+  clues: MysteryClueView[];
+}
+
+/** Momento de la cronología: solo lo que la partida puede saber (never el evento objetivo). */
+export interface MysteryTimelinePointView {
+  time: string;
+  publicKnowledge: string;
+}
+
+/** Ficha pública de otro personaje: para sospechar, nada de su vida privada. */
+export interface MysteryCharacterBriefView {
+  characterId: string;
+  playerId: string;
+  name: string;
+  publicInfo: string;
+}
+
+/** Personaje asignado al llamador: incluye SU información privada. */
+export interface MysteryCharacterPrivateView {
+  characterId: string;
+  playerId: string;
+  name: string;
+  description: string;
+  publicInfo: string;
+  privateInfo: string;
+  secrets: string;
+  objectives: string[];
+  isVictim: boolean;
+  /** Solo true si el llamador ES el asesino (nunca el flag ajeno). */
+  isMurderer?: boolean;
+  /** Solo true si el llamador ES el cómplice. */
+  isAccomplice?: boolean;
+}
+
+/** Respuesta completa a GET /games/{id}/mystery para el jugador que llama. */
+export interface MysteryPayloadView {
+  title: string;
+  setting: string;
+  synopsis: string;
+  victim: { name: string; deathDetail: string };
+  myCharacter: MysteryCharacterPrivateView;
+  otherCharacters: MysteryCharacterBriefView[];
+  rooms: MysteryRoomView[];
+  timeline: MysteryTimelinePointView[];
 }
 
 // ---------------------------------------------------------------------------
@@ -193,6 +339,14 @@ export type ApiErrorCode =
   | 'AUTH_INVALID'
   | 'RATE_LIMITED'
   | 'BACKEND_NOT_CONFIGURED'
+  | /** Condiciones de inicio incumplidas (mínimo de jugadores, perfiles pendientes). */
+  'GAME_NOT_READY'
+  | /** Ya existe una generación en curso para esta partida. */
+  'GENERATION_IN_PROGRESS'
+  | /** Proveedor de IA sin configurar (503 controlado, § integración IA). */
+  'GENERATION_NOT_CONFIGURED'
+  | /** El misterio todavía no está listo para jugarse (409 controlado). */
+  'MYSTERY_NOT_READY'
   | 'INTERNAL_ERROR'
   | 'NOT_FOUND'
   | 'NETWORK_ERROR';
