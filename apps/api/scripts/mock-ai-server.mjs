@@ -5,9 +5,10 @@
  *   memoria; GET /__last devuelve lo último recibido (para verificar el
  *   JSON exacto que el backend envió).
  * · Responde 200 con un MYSTERIO COMPLETO Y VÁLIDO según mystery-schema.ts
- *   (una víctima jugable, un asesino distinto, pistas, cronología...), así
- *   el backend lo valida, lo almacena y marca 'ready' — todo el camino
- *   feliz sin gastar saldo del proveedor real.
+ *   (una víctima jugable, un asesino distinto, pistas, cronologías
+ *   individuales, timeline pública...), así el backend lo valida, lo
+ *   almacena y marca 'ready' — todo el camino feliz sin gastar saldo del
+ *   proveedor real.
  * · Si el body no lleva mysteryContext responde 400: también se puede
  *   probar el camino de error (GENERATION_HTTP_ERROR → 'generation_error').
  *
@@ -44,6 +45,47 @@ function buildMystery(context) {
     isAccomplice: false,
   }));
 
+  // Cronologías individuales (FASE investigación): cada personaje sabe SU
+  // itinerario real y lo que declara; la víctima interactúa con todos.
+  const withTimeline = characters.map((character, index) => ({
+    ...character,
+    personalTimeline: [
+      {
+        time: '21:00',
+        location: 'Porche de la finca (mock)',
+        event: `${character.name} llega y saluda (mock).`,
+        involvedCharacterIds: [],
+        publicClaim: `${character.name} declara que llegó sobre las 21:00 (mock).`,
+      },
+      {
+        time: '22:30',
+        location: 'Salón (mock)',
+        event: `${character.name} charla en el salón (mock).`,
+        involvedCharacterIds: characters
+          .filter((other) => other.characterId !== character.characterId)
+          .map((other) => other.characterId),
+        publicClaim: `${character.name} dice que estuvo todo el rato conversando (mock).`,
+      },
+      {
+        time: '23:45',
+        location: 'Cocina (mock)',
+        event:
+          index === victimIndex
+            ? `${character.name} sube al salón con su última copa (mock).`
+            : `${character.name} pasa por la cocina (mock).`,
+        involvedCharacterIds: [],
+        publicClaim: `Nadie lo sabe: ${character.name} declara que estaba en su cuarto (mock).`,
+      },
+      {
+        time: '00:30',
+        location: 'Despacho (mock)',
+        event: `${character.name} espera en el despacho (mock).`,
+        involvedCharacterIds: [],
+        publicClaim: `${character.name} declara que dormía (mock).`,
+      },
+    ],
+  }));
+
   return {
     title: `La partida ${context.gameCode} ha salido mal (mock)`,
     setting: 'Mock: aniversario en una finca rural donde reaparecen viejos vínculos.',
@@ -59,7 +101,7 @@ function buildMystery(context) {
       method: 'Mock: veneno en la última copa.',
       explanation: 'Mock: reconstrucción cronológica completa del crimen de ejemplo.',
     },
-    characters,
+    characters: withTimeline,
     npcs: [{ name: 'Policía local (mock)', description: 'Levanta acta y toma declaraciones.' }],
     rooms: [
       {
@@ -78,7 +120,7 @@ function buildMystery(context) {
             clueId: 'clue-2',
             name: 'Nota arrugada (mock)',
             content: 'Una nota con una cifra y las iniciales de la víctima.',
-            discoveredBy: characters[context.players.length - 1]?.playerId ?? '*',
+            discoveredBy: characters[murdererIndex]?.playerId ?? '*',
             knownTo: [],
           },
         ],

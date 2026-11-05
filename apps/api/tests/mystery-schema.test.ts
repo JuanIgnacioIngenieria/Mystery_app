@@ -64,6 +64,15 @@ function validMystery() {
         objectives: ['Descubrir quién falsificó el inventario.'],
         isMurderer: false,
         isAccomplice: false,
+        personalTimeline: [
+          {
+            time: '22:30',
+            location: 'Sala de barricas',
+            event: 'Cuenta barricas con la víctima.',
+            involvedCharacterIds: ['char-3'],
+            publicClaim: 'Declara que revisó la venta.',
+          },
+        ],
       },
       {
         characterId: 'char-2',
@@ -77,6 +86,15 @@ function validMystery() {
         objectives: ['Que nadie descubra el testamento falsificado.'],
         isMurderer: true,
         isAccomplice: false,
+        personalTimeline: [
+          {
+            time: '23:45',
+            location: 'Sala de barricas',
+            event: 'Envenena la copa mientras nadie mira.',
+            involvedCharacterIds: [],
+            publicClaim: 'Dice que cenó en su cuarto.',
+          },
+        ],
       },
       {
         characterId: 'char-3',
@@ -90,6 +108,15 @@ function validMystery() {
         objectives: ['Descubrir quién la envenenó.'],
         isMurderer: false,
         isAccomplice: false,
+        personalTimeline: [
+          {
+            time: '23:15',
+            location: 'Cocina',
+            event: 'Prepara el postre con la dueña.',
+            involvedCharacterIds: ['char-1'],
+            publicClaim: 'Declara que estuvo en la cocina.',
+          },
+        ],
       },
     ],
     npcs: [{ name: 'Policía local Herrera', description: 'Investiga y toma declaraciones.' }],
@@ -284,5 +311,56 @@ describe('validateMysteryPayload · víctima jugable (nuevo diseño)', () => {
     payload.solution.accompliceCharacterId = 'char-3';
     const issues = failureIssues(validateMysteryPayload(payload, CONTEXT));
     expect(issues.join('\n')).toContain('la víctima no puede ser el mismo personaje que el cómplice');
+  });
+});
+
+describe('validateMysteryPayload · cronologías individuales (FASE investigación)', () => {
+  it('rechaza un personaje sin cronología individual', () => {
+    const payload = clone(validMystery()) as {
+      characters: Array<{ personalTimeline?: unknown }>;
+    };
+    delete payload.characters[1]!.personalTimeline;
+    const issues = failureIssues(validateMysteryPayload(payload, CONTEXT));
+    expect(issues.join('\n')).toContain('personalTimeline');
+  });
+
+  it('rechaza un personaje con cronología vacía', () => {
+    const payload = clone(validMystery()) as {
+      characters: Array<{ personalTimeline: unknown[] }>;
+    };
+    payload.characters[0]!.personalTimeline = [];
+    const issues = failureIssues(validateMysteryPayload(payload, CONTEXT));
+    expect(issues.join('\n')).toContain('personalTimeline');
+  });
+
+  it('rechaza involvedCharacterIds que citan personajes inexistentes', () => {
+    const payload = clone(validMystery()) as {
+      characters: Array<{ personalTimeline: Array<{ involvedCharacterIds: string[] }> }>;
+    };
+    payload.characters[0]!.personalTimeline[0]!.involvedCharacterIds = ['char-99'];
+    const issues = failureIssues(validateMysteryPayload(payload, CONTEXT));
+    expect(issues.join('\n')).toContain('char-99');
+  });
+
+  it('rechaza clueIds duplicados entre habitaciones (romperían el candado atómico)', () => {
+    const payload = clone(validMystery()) as {
+      rooms: Array<{ roomId?: string; name?: string; description?: string; clues: Array<Record<string, unknown>> }>;
+    };
+    payload.rooms.push({
+      roomId: 'room-2',
+      name: 'Cocina',
+      description: 'Duplicada para el test.',
+      clues: [
+        {
+          clueId: 'clue-1', // mismo clueId que room-1
+          name: 'Duplicada',
+          content: 'Pista repetida.',
+          discoveredBy: '*',
+          knownTo: [],
+        },
+      ],
+    });
+    const issues = failureIssues(validateMysteryPayload(payload, CONTEXT));
+    expect(issues.join('\n')).toContain('clueIds duplicados');
   });
 });

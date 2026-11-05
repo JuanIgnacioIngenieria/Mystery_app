@@ -65,6 +65,24 @@ export const mysterySchema = z.object({
         /** Secreto que oculta: puede incriminarle sin ser el asesino. */
         secrets: z.string().min(1),
         objectives: z.array(z.string().min(1)).min(1),
+        /**
+         * Cronología INDIVIDUAL del personaje (FASE investigación): sus
+         * momentos reales, lugares e interacciones; `publicClaim` es lo que
+         * el personaje DECLARA (pueden mentir u ocultar, los hechos no).
+         * `.default([])` mantiene legibles misterios generados antes de
+         * este campo; la generación NUEVA exige entradas (regla cruzada 8).
+         */
+        personalTimeline: z
+          .array(
+            z.object({
+              time: z.string().min(1),
+              location: z.string().min(1),
+              event: z.string().min(1),
+              involvedCharacterIds: z.array(z.string()).default([]),
+              publicClaim: z.string().min(1),
+            }),
+          )
+          .default([]),
         isMurderer: z.boolean(),
         isAccomplice: z.boolean(),
       }),
@@ -264,10 +282,40 @@ export function validateMysteryPayload(
     }
   }
 
-  // 7. Identificadores de habitaciones únicos (roomId citable en el resultado).
+  // 7. Identificadores de habitaciones y pistas únicos: el roomId es citable
+  //    en el resultado y el clueId es la CLAVE del documento de Firestore que
+  //    garantiza que una pista se descubre UNA sola vez (duplicados romperían
+  //    el candado de la transacción de investigación).
   const duplicateRoomIds = countDuplicates(mystery.rooms.map((room) => room.roomId));
   if (duplicateRoomIds.length > 0) {
     issues.push(`roomIds duplicados: ${duplicateRoomIds.join(', ')}`);
+  }
+  const duplicateClueIds = countDuplicates(
+    mystery.rooms.flatMap((room) => room.clues.map((clue) => clue.clueId)),
+  );
+  if (duplicateClueIds.length > 0) {
+    issues.push(`clueIds duplicados entre habitaciones: ${duplicateClueIds.join(', ')}`);
+  }
+
+  // 8. Cronologías individuales: la FASE de investigación y la pantalla de
+  //    introducción las necesitan por personaje (nada de itinerarios vacíos),
+  //    y sus interacciones citan personajes que existen.
+  for (const character of mystery.characters) {
+    if (character.personalTimeline.length === 0) {
+      issues.push(
+        `el personaje ${character.characterId} (${character.name}) no tiene personalTimeline: ` +
+          'cada personaje necesita su cronología individual con al menos 1 momento',
+      );
+    }
+    for (const point of character.personalTimeline) {
+      for (const involved of point.involvedCharacterIds) {
+        if (!knownCharacterIds.has(involved)) {
+          issues.push(
+            `personalTimeline de ${character.characterId} cita un personaje inexistente: ${involved}`,
+          );
+        }
+      }
+    }
   }
 
   if (issues.length > 0) return { ok: false, issues };

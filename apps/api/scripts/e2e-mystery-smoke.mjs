@@ -333,6 +333,265 @@ async function main() {
   check('mystery: rooms visibles con pistas para el llamador', views.every((view) => (view.body.rooms?.length ?? 0) >= 1), '');
   check('mystery: cronología sin el evento objetivo', views.every((view) => (view.body.timeline?.length ?? 0) >= 1 && !('event' in (view.body.timeline?.[0] ?? {}))), '');
 
+  // 9c. FASE DE INVESTIGACIÓN: privacidad de la vista + atomicidad real.
+  //      · El CONTENIDO de las pistas no viaja en la vista del misterio.
+  //      · myCharacter.personalTimeline presente (≥ 1 punto, aquí ≥ 4 del mock).
+  check(
+    'mystery: las pistas de las rooms NO llevan content',
+    views.every((view) =>
+      (view.body.rooms ?? []).every((room) =>
+        (room.clues ?? []).every((clue) => typeof clue.name === 'string' && !('content' in clue)),
+      ),
+    ),
+    '',
+  );
+  check(
+    'mystery: myCharacter.personalTimeline completa (mock: 4 puntos)',
+    views.every((view) => (view.body.myCharacter?.personalTimeline?.length ?? 0) >= 4),
+    JSON.stringify(views.map((view) => view.body.myCharacter?.personalTimeline?.length)),
+  );
+  check(
+    'mystery: cada punto de la cronología lleva sus campos',
+    views.every((view) =>
+      (view.body.myCharacter?.personalTimeline ?? []).every(
+        (point) =>
+          typeof point.time === 'string' &&
+          typeof point.location === 'string' &&
+          typeof point.event === 'string' &&
+          Array.isArray(point.involvedCharacterIds) &&
+          typeof point.publicClaim === 'string',
+      ),
+    ),
+    '',
+  );
+
+  // Estado inicial de la investigación. Mock: rooms [salón: clue-1 pública,
+  // clue-2 SOLO del asesino; cocina: clue-3 pública]. Host y p2 ven 2 pistas;
+  // el asesino ve 3.
+  const murdererView = views.find((view) => view.body.myCharacter?.isMurderer === true);
+  const murdererId = murdererView?.playerId;
+  const murdererToken = murdererId ? playersTokens.get(murdererId)?.token : undefined;
+  check('investigación: localizado el jugador asesino', Boolean(murdererToken), `murdererId=${murdererId}`);
+
+  const initialStates = [];
+  for (const [playerIdEntry, tokenEntry] of playersTokens) {
+    const answer = await api(`/games/${gameId}/investigation`, { token: tokenEntry.token });
+    initialStates.push({ playerId: playerIdEntry, status: answer.status, body: answer.json ?? {} });
+  }
+  check('investigación: 200 para los 3', initialStates.every((entry) => entry.status === 200), '');
+  const stateOf = (playerId) => initialStates.find((entry) => entry.playerId === playerId)?.body ?? null;
+  check(
+    'investigación: elegibilidad exacta por jugador (2 pistas no asesino, 3 el asesino)',
+    // El asesino del mock podría ser cualquiera de los 3 (rotate). Contamos
+    // contra la vista del misterio: pistas por jugador según discoveredBy.
+    views.length === 3 &&
+      views.every((view) => {
+        const eligibleCount = (view.body.rooms ?? []).reduce(
+          (sum, room) => sum + (room.clues?.length ?? 0),
+          0,
+        );
+        const state = stateOf(view.playerId);
+        return (state?.clueStates?.length ?? -1) === eligibleCount;
+      }),
+    JSON.stringify(views.map((view) => [
+      view.body.myCharacter?.isMurderer === true,
+      (view.body.rooms ?? []).reduce((sum, room) => sum + (room.clues?.length ?? 0), 0),
+      stateOf(view.playerId)?.clueStates?.length,
+    ])),
+  );
+  check(
+    'investigación: pistas sin descubrir empiezan available',
+    initialStates.every((entry) => (entry.body.clueStates ?? []).every((clue) => clue.status === 'available' && clue.byPlayerId === null)),
+    '',
+  );
+  check(
+    'investigación: sin pistas descubiertas aún',
+    initialStates.every((entry) => (entry.body.myDiscoveredClues?.length ?? 0) === 0),
+    '',
+  );
+  check(
+    'investigación: cuaderno vacío al empezar',
+    initialStates.every((entry) => entry.body.notebook?.content === '' && entry.body.notebook?.updatedAt === null),
+    '',
+  );
+
+  // Descubrimiento CONCURRENTE de clue-1 (pública): claim en Promise.all con
+  // dos jugadores no asesinos → EXACTO un ganador; el otro recibe 409
+  // CLUE_UNAVAILABLE (la transacción decide, nunca el móvil).
+  const clue1 = stateOf(playerIds[0])?.clueStates?.find((clue) => clue.status === 'available' && clue.roomId !== '');
+  const clue1Id = clue1?.clueId;
+  check('investigación: localizada una pista pública para la carrera', Boolean(clue1Id), `clueId=${clue1Id}`);
+  const racers = [...playersTokens.entries()].filter(([id]) => id !== murdererId);
+  const race = await Promise.all(
+    racers.map(([id, entry]) => api(`/games/${gameId}/clues/${clue1Id}/claim`, { method: 'POST', token: entry.token })),
+  );
+  const raceWinners = race.filter((result) => result.status === 200);
+  const raceLosers = race.filter((result) => result.status !== 200);
+  check(
+    'investigación: carrera concurrente → exactamente 1 reserva',
+    raceWinners.length === 1 && raceLosers.length === 1,
+    `200=${raceWinners.length} otros=${raceLosers.length}`,
+  );
+  check(
+    'investigación: el perdedor recibe 409 CLUE_UNAVAILABLE',
+    raceLosers.length === 1 && raceLosers[0]?.status === 409 && raceLosers[0]?.json?.error?.code === 'CLUE_UNAVAILABLE',
+    JSON.stringify(raceLosers[0]?.json?.error),
+  );
+  const raceWinnerIndex = race.findIndex((result) => result.status === 200);
+  if (raceWinnerIndex === -1) {
+    check('investigación: hay ganador de la carrera', false, 'ningún claim devolvió 200; abortando la fase de pistas');
+    throw new Error('smoke: fase de investigación sin reservas iniciales');
+  }
+  const raceWinnerEntry = racers[raceWinnerIndex][1];
+  const raceWinnerId = racers[raceWinnerIndex][0];
+
+  // reveal del ganador: contenido íntegro y permanente.
+  const winnerReveal = await api(`/games/${gameId}/clues/${clue1Id}/reveal`, { method: 'POST', token: raceWinnerEntry.token });
+  check(
+    'investigación: reveal del ganador → 200 con contenido',
+    winnerReveal.status === 200 && typeof winnerReveal.json?.content === 'string' && winnerReveal.json.content.length > 0 &&
+      winnerReveal.json.clueId === clue1Id,
+    `len=${winnerReveal.json?.content?.length}`,
+  );
+  // reveal idempotente: repetirlo redevuelve el contenido.
+  const winnerReveal2 = await api(`/games/${gameId}/clues/${clue1Id}/reveal`, { method: 'POST', token: raceWinnerEntry.token });
+  check(
+    'investigación: reveal idempotente para su dueño',
+    winnerReveal2.status === 200 && winnerReveal2.json?.content === winnerReveal.json?.content,
+    '',
+  );
+  // reveal del perdedor sin reserva → 409.
+  const loserToken = racers.find(([id]) => id !== raceWinnerId)[1].token;
+  const loserReveal = await api(`/games/${gameId}/clues/${clue1Id}/reveal`, { method: 'POST', token: loserToken });
+  check(
+    'investigación: reveal sin reserva propia → 409',
+    loserReveal.status === 409 && loserReveal.json?.error?.code === 'CLUE_UNAVAILABLE',
+    JSON.stringify(loserReveal.json?.error),
+  );
+  // claim de una pista YA descubierta → 409.
+  const reClaimLost = await api(`/games/${gameId}/clues/${clue1Id}/claim`, { method: 'POST', token: loserToken });
+  check(
+    'investigación: claim sobre pista descubierta por otro → 409',
+    reClaimLost.status === 409 && reClaimLost.json?.error?.code === 'CLUE_UNAVAILABLE',
+    JSON.stringify(reClaimLost.json?.error),
+  );
+
+  // Elegibilidad: una pista PRIVADA del asesino (clue-2) no la puede otro.
+  // Es la pista que SOLO aparece en la vista del misterio del asesino.
+  let privateClueId = null;
+  const murdererStateIds = new Set((stateOf(murdererId)?.clueStates ?? []).map((clue) => clue.clueId));
+  for (const clueId of murdererStateIds) {
+    const nobodyElseHas = views
+      .filter((view) => view.playerId !== murdererId)
+      .every((view) => !(view.body.rooms ?? []).some((room) => (room.clues ?? []).some((clue) => clue.clueId === clueId)));
+    if (nobodyElseHas) privateClueId = clueId;
+  }
+  if (privateClueId) {
+    const ineligibleClaim = await api(`/games/${gameId}/clues/${privateClueId}/claim`, { method: 'POST', token: loserToken });
+    check(
+      'investigación: pista privada del asesino → 403 para otro jugador',
+      ineligibleClaim.status === 403 && ineligibleClaim.json?.error?.code === 'CLUE_UNAVAILABLE',
+      JSON.stringify(ineligibleClaim.json?.error),
+    );
+    const murdererClaim = await api(`/games/${gameId}/clues/${privateClueId}/claim`, { method: 'POST', token: murdererToken });
+    check(
+      'investigación: el asesino SÍ puede reservar su pista privada',
+      murdererClaim.status === 200,
+      JSON.stringify(murdererClaim.json),
+    );
+    // Release: el asesino libera y otro jugador NO gana acceso (sigue siendo privada).
+    const murdererRelease = await api(`/games/${gameId}/clues/${privateClueId}/release`, { method: 'POST', token: murdererToken });
+    check(
+      'investigación: release de la reserva propia → ok',
+      murdererRelease.status === 200 && murdererRelease.json?.ok === true,
+      '',
+    );
+    const afterReleaseState = await api(`/games/${gameId}/investigation`, { token: murdererToken });
+    check(
+      'investigación: tras release la pista vuelve a available',
+      (afterReleaseState.json?.clueStates ?? []).some((clue) => clue.clueId === privateClueId && clue.status === 'available'),
+      '',
+    );
+  } else {
+    check('investigación: pista privada localizada en el mock', false, 'el mock no produjo clue solo-para-asesino');
+  }
+
+  // Reserva → reveal del asesino en clue-3 (pública, otra habitación): el
+  // estado registrado queda permanente y visible en myDiscoveredClues.
+  const murdererClue3 = (stateOf(murdererId)?.clueStates ?? []).find(
+    (clue) => clue.clueId !== clue1Id && clue.clueId !== privateClueId,
+  );
+  if (murdererClue3) {
+    const mClaim = await api(`/games/${gameId}/clues/${murdererClue3.clueId}/claim`, { method: 'POST', token: murdererToken });
+    const mReveal = await api(`/games/${gameId}/clues/${murdererClue3.clueId}/reveal`, { method: 'POST', token: murdererToken });
+    check(
+      'investigación: claim+reveal de una segunda pista → descubierta',
+      mClaim.status === 200 && mReveal.status === 200 && typeof mReveal.json?.content === 'string',
+      '',
+    );
+    const murdererStateAfter = await api(`/games/${gameId}/investigation`, { token: murdererToken });
+    check(
+      'investigación: myDiscoveredClues del dueño (solo sus pistas, con contenido)',
+      (murdererStateAfter.json?.myDiscoveredClues?.length ?? 0) === 1 &&
+        murdererStateAfter.json.myDiscoveredClues.every(
+          (clue) => clue.clueId === murdererClue3.clueId && typeof clue.content === 'string' && clue.content.length > 0,
+        ),
+      JSON.stringify(murdererStateAfter.json?.myDiscoveredClues?.map((clue) => [clue.clueId, clue.content?.length])),
+    );
+    const winnerStateAfter = await api(`/games/${gameId}/investigation`, { token: raceWinnerEntry.token });
+    check(
+      'investigación: myDiscoveredClues solo del llamador (el ganador ve 1, no las del asesino)',
+      (winnerStateAfter.json?.myDiscoveredClues?.length ?? 0) === 1 &&
+        winnerStateAfter.json.myDiscoveredClues.every((clue) => clue.clueId === clue1Id),
+      JSON.stringify(winnerStateAfter.json?.myDiscoveredClues?.map((clue) => clue.clueId)),
+    );
+    check(
+      'investigación: estados sincronizados (pista del asesino en discovered con byPlayerId)',
+      (winnerStateAfter.json?.clueStates ?? []).some(
+        (clue) => clue.clueId === murdererClue3.clueId && clue.status === 'discovered' && clue.byPlayerId === murdererId,
+      ),
+      '',
+    );
+  }
+
+  // Cuaderno privado: aislado POR JUGADOR y validación del límite de tamaño.
+  const HOST = playersTokens.get(hostId);
+  const notebookWrite = await api(`/games/${gameId}/notebook`, {
+    method: 'PUT',
+    token: HOST.token,
+    body: { content: 'Suspechas: la copa es de p2…\nNota 2: el horario no cuadra.' },
+  });
+  check('cuaderno: autoguardado del host → ok', notebookWrite.status === 200 && notebookWrite.json?.ok === true, '');
+  const notebookRead = await api(`/games/${gameId}/notebook`, { token: HOST.token });
+  check(
+    'cuaderno: el host lee SU texto',
+    notebookRead.status === 200 && notebookRead.json?.content?.includes('Suspechas: la copa es de p2'),
+    JSON.stringify(notebookRead.json),
+  );
+  const notebookOther = await api(`/games/${gameId}/notebook`, { token: loserToken });
+  check(
+    'cuaderno: PRIVACIDAD → otro jugador sigue viendo vacío',
+    notebookOther.status === 200 && notebookOther.json?.content === '',
+    JSON.stringify(notebookOther.json),
+  );
+  const notebookTooBig = await api(`/games/${gameId}/notebook`, {
+    method: 'PUT',
+    token: HOST.token,
+    body: { content: 'x'.repeat(20_001) },
+  });
+  check(
+    'cuaderno: límite de 20000 caracteres (400/413 controlado)',
+    (notebookTooBig.status === 400 || notebookTooBig.status === 413) && notebookTooBig.json?.error?.code === 'VALIDATION_ERROR',
+    JSON.stringify(notebookTooBig.json?.error),
+  );
+  const stateAfterNotebook = await api(`/games/${gameId}/investigation`, { token: HOST.token });
+  check(
+    'cuaderno: también viaja en el estado de investigación',
+    stateAfterNotebook.json?.notebook?.content?.includes('Suspechas') === true &&
+      typeof stateAfterNotebook.json?.notebook?.updatedAt === 'string',
+    '',
+  );
+
   // 10. Abandono del host → cerrar la partida (tumba identificable)
   const leave = await api(`/games/${gameId}/leave`, { method: 'POST', token: hostToken });
   check('abandono del host → partida cerrada', leave.status === 200, `gameId=${gameId}`);

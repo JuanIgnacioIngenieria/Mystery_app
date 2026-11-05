@@ -1,5 +1,4 @@
 import type { Request, RequestHandler } from 'express';
-import type { ZodType } from 'zod';
 import {
   createGameSchema,
   joinGameSchema,
@@ -17,30 +16,13 @@ import { createRateLimiter } from '../middleware/rate-limit.js';
 import { createGame, getGameState, joinGameByCode, leaveGame, startGame, updatePlayerProfile } from '../services/games.service.js';
 import { getMysteryForPlayer } from '../services/mystery.service.js';
 import { httpError } from '../utils/errors.js';
+import { gameIdParam, parseBody, withPlayer } from '../utils/request-helpers.js';
 
 /**
  * Límites conservadores: crear/unirse son las operaciones sensibles
  * (crean documentos y pueden usarse para sondear códigos).
  */
 const WRITE_LIMITER = createRateLimiter({ windowMs: 60_000, max: 20 });
-
-/**
- * Valida el body con un schema zod y guarda el resultado tipado en
- * res.locals.input. Única puerta de entrada: ningún handler confía
- * en lo que envía el cliente.
- */
-function parseBody<T>(schema: ZodType<T>): RequestHandler {
-  return (req, res, next) => {
-    const result = schema.safeParse(req.body);
-    if (!result.success) {
-      const issue = result.error.issues.at(0);
-      next(httpError(400, 'VALIDATION_ERROR', issue?.message ?? 'Datos inválidos.'));
-      return;
-    }
-    res.locals.input = result.data;
-    next();
-  };
-}
 
 const readInput = (res: unknown): CreateGameInput | JoinGameInput => {
   // narrow con as aquí es aceptable: parseBody ya garantizó la forma.
@@ -87,9 +69,7 @@ gamesRouter.post(
  */
 gamesRouter.get('/:gameId/state', requirePlayerAuth, async (req, res, next) => {
   try {
-    // Igual que en auth: los params de Express 5 pueden tipar como array.
-    const rawGameId = req.params.gameId ?? '';
-    const gameId = Array.isArray(rawGameId) ? (rawGameId[0] ?? '') : rawGameId;
+    const gameId = gameIdParam(req);
     if (gameId.length === 0) {
       throw httpError(400, 'VALIDATION_ERROR', 'Falta el identificador de la partida.');
     }
@@ -103,24 +83,6 @@ gamesRouter.get('/:gameId/state', requirePlayerAuth, async (req, res, next) => {
 
 // Export del tipo de payload para reutilizarlo en la app sin duplicarlo.
 export type { GameSessionPayload };
-
-/**
- * Helper de las rutas autenticadas sin body: la identidad del jugador SIEMPRE
- * viene de req.player (la fija requirePlayerAuth con el token) y el gameId
- * del path, nunca de lo que el cliente diga en ellos.
- */
-async function withPlayer(
-  req: Request,
-  run: (gameId: string, playerId: string) => Promise<unknown>,
-): Promise<unknown> {
-  const rawGameId = req.params.gameId ?? '';
-  const gameId = Array.isArray(rawGameId) ? (rawGameId[0] ?? '') : rawGameId;
-  const playerId = req.player?.playerId ?? '';
-  if (gameId.length === 0 || playerId.length === 0) {
-    throw httpError(401, 'AUTH_MISSING', 'Falta el token de acceso a la partida.');
-  }
-  return run(gameId, playerId);
-}
 
 /**
  * Vista del misterio PARA EL JUGADOR que llama (requiere partida 'ready').
@@ -178,8 +140,7 @@ gamesRouter.patch(
   parseBody(updatePlayerProfileSchema),
   async (req, res, next) => {
     try {
-      const rawGameId = req.params.gameId ?? '';
-      const gameId = Array.isArray(rawGameId) ? (rawGameId[0] ?? '') : rawGameId;
+      const gameId = gameIdParam(req);
       const playerId = req.player?.playerId ?? '';
       if (gameId.length === 0 || playerId.length === 0) {
         throw httpError(401, 'AUTH_MISSING', 'Falta el token de acceso a la partida.');

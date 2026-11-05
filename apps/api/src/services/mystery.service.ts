@@ -13,10 +13,12 @@ import { createRemoteMysteryProvider } from './mystery-generation/remote-provide
 import { createDeepseekProvider } from './mystery-generation/deepseek-provider.js';
 import { validateMysteryPayload } from './mystery-generation/mystery-schema.js';
 import { mysterySchema } from './mystery-generation/mystery-schema.js';
+import type { MysteryDocument } from './mystery-generation/mystery-schema.js';
 import type {
   MysteryPayloadView,
   MysteryClueView,
   MysteryRoomView,
+  MysteryPersonalTimelinePoint,
 } from '@mystery/shared';
 
 // ---------------------------------------------------------------------------
@@ -175,23 +177,14 @@ export async function runMysteryGeneration(gameId: string): Promise<void> {
 }
 
 /**
- * VISTA del misterio PARA EL JUGADOR que llama (FASE 6).
- *
- * Doble filtro defensivo antes de enviar nada al cliente:
- *   · La partida debe estar 'ready' (o la compatibilidad 'in_progress') y el
- *     documento mystery/current debe existir y pasar el esquema de nuevo
- *     (el almacenamiento es trustworthy pero Firestore no es de confianza).
- *   · Del payload SOLO viajan: contenido compartido (title/setting/synopsis,
- *     victim deathDetail), SU personaje completo (su privateInfo/secrets/
- *     objectives), el info pública del resto (para sospechar), las pistas
- *     visibles para él y la cronología con su "publicKnowledge" (el evento
- *     objetivo — la verdad del GM — NO sale). La solution y la resolución
- *     del crimen jamás viajan al inicio de la partida.
+ * Carga y VALIDA games/{id}/mystery/current (compartido por la vista del
+ * misterio y por el servicio de investigación):
+ *   · La partida debe existir y estar 'ready' (o 'in_progress' por
+ *     compatibilidad); en otro caso lanza los mismos errores controlados.
+ *   · Re-parsea el payload con el esquema: Firestore solo es legible a
+ *     través del SDK Admin, pero esto blindaría un documento corrupto.
  */
-export async function getMysteryForPlayer(
-  gameId: string,
-  playerId: string,
-): Promise<MysteryPayloadView> {
+export async function loadValidatedMystery(gameId: string): Promise<MysteryDocument> {
   const gameRef = gameRefOf(gameId);
   const gameSnap = await gameRef.get();
   if (!gameSnap.exists) {
@@ -226,7 +219,28 @@ export async function getMysteryForPlayer(
       'El misterio almacenado está en un formato no válido. El anfitrión puede volver a generarlo.',
     );
   }
-  const mystery = parsed.data;
+  return parsed.data;
+}
+
+/**
+ * VISTA del misterio PARA EL JUGADOR que llama (FASE 6).
+ *
+ * Doble filtro defensivo antes de enviar nada al cliente:
+ *   · La partida debe estar 'ready' (o la compatibilidad 'in_progress') y el
+ *     documento mystery/current debe existir y pasar el esquema de nuevo
+ *     (el almacenamiento es trustworthy pero Firestore no es de confianza).
+ *   · Del payload SOLO viajan: contenido compartido (title/setting/synopsis,
+ *     victim deathDetail), SU personaje completo (su privateInfo/secrets/
+ *     objectives/personalTimeline), el info pública del resto, y las pistas
+ *     de SU alcance SOLO con el nombre (el CONTENIDO de una pista sale del
+ *     backend al descubrirla, § investigación). La solution, la resolución
+ *     y la verdad bruta de la cronología jamás viajan al cliente.
+ */
+export async function getMysteryForPlayer(
+  gameId: string,
+  playerId: string,
+): Promise<MysteryPayloadView> {
+  const mystery = await loadValidatedMystery(gameId);
 
   const mine = mystery.characters.find((character) => character.playerId === playerId);
   if (!mine) {
@@ -248,8 +262,9 @@ export async function getMysteryForPlayer(
       .map(
         (clue): MysteryClueView => ({
           clueId: clue.clueId,
+          // SOLO el nombre: el contenido viaja al descubrir (transacción)
+          // o dentro de myDiscoveredClues del estado de investigación.
           name: clue.name,
-          content: clue.content,
           knownToMe: clue.knownTo.includes(mine.characterId),
         }),
       ),
@@ -269,6 +284,8 @@ export async function getMysteryForPlayer(
       privateInfo: mine.privateInfo,
       secrets: mine.secrets,
       objectives: mine.objectives,
+      // Cronología individual: privada y solo de SU personaje.
+      personalTimeline: mine.personalTimeline satisfies MysteryPersonalTimelinePoint[],
       isVictim: mine.isVictim,
       // El rol de asesino/cómplice solo viaja a quien lo desempeña: el resto
       // del grupo no puede verlo en el payload (ni por inspección de red).
@@ -281,6 +298,7 @@ export async function getMysteryForPlayer(
         characterId: character.characterId,
         playerId: character.playerId,
         name: character.name,
+        description: character.description,
         publicInfo: character.publicInfo,
       })),
     rooms: roomsView,

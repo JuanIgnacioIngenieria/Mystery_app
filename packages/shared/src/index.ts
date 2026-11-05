@@ -263,11 +263,15 @@ export interface GenerationErrorView {
 // vista de quien lo desempeña.
 // ---------------------------------------------------------------------------
 
-/** Pista visible para el llamador (knownToMe = ya la conoía al empezar). */
+/**
+ * Pista visible para el llamador. SOLO el nombre viaja aquí: el contenido
+ * sale del backend al descubrirla (transacción atómica) o dentro de
+ * DiscoveredClueView para las que ESTE jugador ya descubrió. Así el texto
+ * de una pista jamás está en el móvil de quien no la descubrió.
+ */
 export interface MysteryClueView {
   clueId: string;
   name: string;
-  content: string;
   knownToMe: boolean;
 }
 
@@ -290,6 +294,8 @@ export interface MysteryCharacterBriefView {
   characterId: string;
   playerId: string;
   name: string;
+  /** Retrato del personaje tal como lo conoce la mesa: nunca secretos. */
+  description: string;
   publicInfo: string;
 }
 
@@ -303,11 +309,36 @@ export interface MysteryCharacterPrivateView {
   privateInfo: string;
   secrets: string;
   objectives: string[];
+  /**
+   * Cronología INDIVIDUAL del personaje: sus momentos, lugares real y con
+   * quién se cruzó. Es información privada SUYA (nadie más la recibe) y
+   * alimenta "Mi cronología" (pantalla de introducción) y el menú lateral.
+   */
+  personalTimeline: MysteryPersonalTimelinePoint[];
   isVictim: boolean;
   /** Solo true si el llamador ES el asesino (nunca el flag ajeno). */
   isMurderer?: boolean;
   /** Solo true si el llamador ES el cómplice. */
   isAccomplice?: boolean;
+}
+
+/**
+ * Punto de la cronología individual. Los involvedCharacterIds citan
+ * characterIds del propio misterio; el cliente los resuelve a nombres con
+ * la paleta de personajes de su vista (el backend los validó contra el
+ * contexto, así que no puede venirse uno inventado).
+ */
+export interface MysteryPersonalTimelinePoint {
+  /** Hora (HH:MM) del momento. */
+  time: string;
+  /** Ubicación del personaje en ese momento. */
+  location: string;
+  /** Qué hizo realmente (la verdad de SU itinerario). */
+  event: string;
+  /** Interacciones: characterIds de los personajes presentes. */
+  involvedCharacterIds: string[];
+  /** Lo que este personaje declara sobre el momento (puede mentir u ocultar). */
+  publicClaim: string;
 }
 
 /** Respuesta completa a GET /games/{id}/mystery para el jugador que llama. */
@@ -321,6 +352,85 @@ export interface MysteryPayloadView {
   rooms: MysteryRoomView[];
   timeline: MysteryTimelinePointView[];
 }
+
+// ---------------------------------------------------------------------------
+// FASE DE INVESTIGACIÓN. Tras la pantalla de introducción, los jugadores
+// exploran habitaciones y DESCUBREN pistas: cada pista la puede descubrir
+// exactamente UN jugador (atomicidad garantizada en el backend con una
+// transacción de Firestore, nunca en el cliente). Estado sincronizado por
+// sondeo (el backend no tiene canales push: misma cadencia que el lobby).
+//
+// Almacenamiento (solo vía Admin SDK; las reglas de Firestore deniegan todo):
+//   games/{id}/clues/{clueId}:
+//     { status: 'reserved' | 'discovered', byPlayerId, reservedAt?, discoveredAt? }
+//   games/{id}/notebooks/{playerId}:
+//     { content, updatedAt } — cuaderno privado de cada jugador.
+// ---------------------------------------------------------------------------
+
+/** Estado de una pista para el llamador. */
+export type ClueDiscoveryStatus = 'available' | 'reserved' | 'discovered';
+
+/** Estado vivo de una pista: sincroniza los botones de la habitación. */
+export interface MysteryClueStateView {
+  clueId: string;
+  roomId: string;
+  status: ClueDiscoveryStatus;
+  /** Quien la tiene reservada/descubierta; null mientras esté libre. */
+  byPlayerId: string | null;
+}
+
+/** Pista descubierta POR EL LLAMADOR: con su contenido íntegro. */
+export interface DiscoveredClueView {
+  clueId: string;
+  name: string;
+  content: string;
+  /** ISO 8601 del momento del descubrimiento (ordenar en el menú). */
+  discoveredAt?: string;
+}
+
+/** Cuaderno personal del llamador (contenido + última escritura). */
+export interface NotebookView {
+  content: string;
+  updatedAt: string | null;
+}
+
+/** Respuesta a GET /games/{id}/investigation para el jugador que llama. */
+export interface InvestigationStatePayload {
+  clueStates: MysteryClueStateView[];
+  /** Pistas que ESTE jugador ya descubrió (para su menú lateral). */
+  myDiscoveredClues: DiscoveredClueView[];
+  notebook: NotebookView;
+}
+
+/** Respuesta a POST .../claim: la pista quedó RESERVADA para el llamador. */
+export interface ClueClaimPayload {
+  status: 'reserved';
+}
+
+/** Contenido íntegro de la pista, tras confirmar la reserva del llamador. */
+export interface ClueRevealPayload {
+  clueId: string;
+  name: string;
+  content: string;
+}
+
+/** Respuesta al liberar/persistentizar: forma estable de "hecho". */
+export interface NotebookWritePayload {
+  ok: boolean;
+}
+
+/** Tamaño máximo del cuaderno (caracteres): protege el backend del abuso. */
+export const NOTEBOOK_TEXT_MAX = 20_000;
+
+/** Cuerpo de GET/PUT /games/:id/notebook. Sin trim: el cuaderno respeta
+ *  saltos de línea y espaciados tal como los escribe el jugador. */
+export const notebookUpdateSchema = z.object({
+  content: z
+    .string()
+    .max(NOTEBOOK_TEXT_MAX, `El cuaderno no puede superar los ${NOTEBOOK_TEXT_MAX} caracteres`),
+});
+
+export type NotebookUpdateInput = z.infer<typeof notebookUpdateSchema>;
 
 // ---------------------------------------------------------------------------
 // Códigos de error estables. La app los usa para mostrar el mensaje correcto
@@ -347,6 +457,8 @@ export type ApiErrorCode =
   'GENERATION_NOT_CONFIGURED'
   | /** El misterio todavía no está listo para jugarse (409 controlado). */
   'MYSTERY_NOT_READY'
+  | /** La pista no existe, no es elegible para el llamador, está reservada por otro o ya descubierta. */
+  'CLUE_UNAVAILABLE'
   | 'INTERNAL_ERROR'
   | 'NOT_FOUND'
   | 'NETWORK_ERROR';
