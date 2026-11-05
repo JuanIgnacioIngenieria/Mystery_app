@@ -170,8 +170,13 @@ export function createDeepseekProvider(): MysteryGenerationProvider | null {
         }
 
         if (!response.ok) {
-          // Nos quedamos con el detalle a un lado: el cuerpo completo podría
-          // hablar del prompt; con el estado basta para decidir el reintento.
+          // El cuerpo del error de DeepSeek (error.message / error.type) dice el
+          // parámetro exacto rechazado: se registra recortado para depurar (a
+          // lastGenerationError solo llega la razón legible por estado).
+          const detail = (await response.text().catch(() => '')).slice(0, 500);
+          if (detail.trim().length > 0) {
+            console.warn(`[api] deepseek: HTTP ${response.status} → ${detail.trim()}`);
+          }
           throw new MysteryGenerationError(
             'GENERATION_HTTP_ERROR',
             httpMessageFor(response.status),
